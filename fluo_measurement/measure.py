@@ -120,7 +120,7 @@ def process_time(time, point_data):
     time_data = point_data[point_data['Time'] == time]
     raw_path = time_data['ImagePath'].values[0]
 
-    output_path = os.path.join(output_dir, os.path.basename(raw_path).replace('.ome.tiff', '.csv'))
+    output_path = os.path.join(output_dir, os.path.basename(raw_path).replace('.ome.tif', '.csv'))
     if os.path.exists(output_path):
         print(f"File {output_path} already exists, skipping")
         return

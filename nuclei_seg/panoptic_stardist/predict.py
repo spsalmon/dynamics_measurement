@@ -44,7 +44,7 @@ def segment_nuclei_panoptic_stardist(image_path:str, model:StarDist2D) -> None:
 		print(f'DONE ! {os.path.basename(image_path)}')
 		# Save the mask
 		imwrite(os.path.join(output_mask_dir, os.path.basename(image_path)), nuclei_mask_stack, compression='zlib')
-		classes_df.to_csv(os.path.join(output_class_dir, os.path.basename(image_path).replace('.ome.tiff', '.csv')), index=False)
+		classes_df.to_csv(os.path.join(output_class_dir, os.path.basename(image_path).replace('.ome.tif', '.csv')), index=False)
 
 input_dir = "/mnt/towbin.data/shared/spsalmon/20241115_122955_248_ZIVA_40x_raga1_full_deletion/raw_ometiff/"
 output_mask_dir = "/mnt/towbin.data/shared/spsalmon/20241115_122955_248_ZIVA_40x_raga1_full_deletion/analysis/ch2_stardist/"
