@@ -1,1 +1,1 @@
-salloc --mem=64GB --time=24:00:00 -p all --cpus-per-task=64 --gres=gpu:rtx4090:1
+salloc --mem=32GB --time=24:00:00 -p all --cpus-per-task=32 --gres=gpu:rtx6000:1

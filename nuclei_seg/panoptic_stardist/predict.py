@@ -46,9 +46,9 @@ def segment_nuclei_panoptic_stardist(image_path:str, model:StarDist2D) -> None:
 		imwrite(os.path.join(output_mask_dir, os.path.basename(image_path)), nuclei_mask_stack, compression='zlib')
 		classes_df.to_csv(os.path.join(output_class_dir, os.path.basename(image_path).replace('.ome.tif', '.csv')), index=False)
 
-input_dir = "/mnt/towbin.data/shared/spsalmon/20241115_122955_248_ZIVA_40x_raga1_full_deletion/raw_ometiff/"
-output_mask_dir = "/mnt/towbin.data/shared/spsalmon/20241115_122955_248_ZIVA_40x_raga1_full_deletion/analysis/ch2_stardist/"
-output_class_dir = "/mnt/towbin.data/shared/spsalmon/20241115_122955_248_ZIVA_40x_raga1_full_deletion/analysis/ch2_nuclei_types_stardist/"
+input_dir = "/mnt/towbin.data/shared/igheor/20250408_ZIVA_40x_vhp1_mStayGold_470_471_25C/images_1/RAW_DATA/"
+output_mask_dir = "/mnt/towbin.data/shared/igheor/20250408_ZIVA_40x_vhp1_mStayGold_470_471_25C/analysis/ch2_stardist/"
+output_class_dir = "/mnt/towbin.data/shared/igheor/20250408_ZIVA_40x_vhp1_mStayGold_470_471_25C/analysis/ch2_nuclei_types_stardist/"
 
 os.makedirs(output_mask_dir, exist_ok=True)
 os.makedirs(output_class_dir, exist_ok=True)
@@ -58,7 +58,7 @@ use_gpu = gputools_available()
 print(f"GPU enabled: {use_gpu}")
 
 images_path = sorted([os.path.join(input_dir, x) for x in os.listdir(input_dir)])
-images_path = [x for x in images_path if 'DIA' not in x]
+images_path = [x for x in images_path if '.ome' in x]
 
 model = StarDist2D(None, name='panoptic_stardist_emr_semi_auto_no_grid', basedir='/mnt/towbin.data/shared/spsalmon/models/stardist/')
 
