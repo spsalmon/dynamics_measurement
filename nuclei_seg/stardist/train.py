@@ -11,11 +11,50 @@ from csbdeep.utils import Path, normalize
 
 from stardist import fill_label_holes, random_label_cmap, calculate_extents, gputools_available
 from stardist.models import Config2D, StarDist2D
-from towbintools.foundation.image_handling import read_tiff_file
 import argparse
 import yaml
 import shutil
 import pandas as pd
+from typing import Optional
+
+def copy_without_permissions(src, dst):
+    """Copy file without preserving permissions"""
+    with open(src, 'rb') as fsrc:
+        with open(dst, 'wb') as fdst:
+            shutil.copyfileobj(fsrc, fdst)
+    return dst
+
+# copy of the code from towbintools, so that we do not need to install it
+def read_tiff_file(
+    file_path: str,
+    channels_to_keep: Optional[list[int]] = None,
+) -> np.ndarray:
+    """
+    Read a TIFF file and optionally select specific channels from the image.
+
+    Parameters:
+            file_path (str): Path to the TIFF image file.
+            channels_to_keep (list): List of channel indices to keep. If empty or None, all channels are kept.
+
+    Returns:
+            np.ndarray: The image data as a NumPy array. The number of dimensions may vary depending on the input and selected channels.
+
+    Raises:
+            ValueError: If the image file cannot be read.
+    """
+    try:
+        image = imread(file_path)
+    except Exception as e:
+        raise ValueError(f"Error while reading image file {file_path} : {e}")
+
+    # If no channels are specified, return the image as is.
+    if image.ndim == 2 or not channels_to_keep:
+        return image
+
+    if image.ndim == 3:
+        return image[channels_to_keep, ...].squeeze()  # type: ignore
+    else:
+        return image[:, channels_to_keep, ...].squeeze()  # type: ignore
 
 np.random.seed(42)
 lbl_cmap = random_label_cmap()
@@ -38,6 +77,7 @@ classes_directories = config.get("classes_directories", None)
 save_dir = config.get("save_dir", None)
 model_name = config.get("model_name", None)
 checkpoint_path = config.get("continue_training_from_checkpoint", None)
+pretrained_model = config.get("pretrained_model", None)
 n_rays = config.get("n_rays", 32)
 panoptic = config.get("panoptic", False)
 n_classes = config.get("n_classes", None)
@@ -45,16 +85,18 @@ max_epochs = config.get("max_epochs", 400)
 steps_per_epoch = config.get("steps_per_epoch", 100)
 patch_size = config.get("patch_size", 512)
 train_val_split_ratio = config.get("train_val_split_ratio", 0.2)
-subsample_factor = config.get("subsample_factor", 1)
+downsample_factor = config.get("downsample_factor", 1)
 channels_to_segment = config.get("channels_to_segment", [0])
 use_gpu = config.get("use_gpu", True)
+
+use_gpu = use_gpu and gputools_available()
 
 def random_fliprot(img, mask): 
     assert img.ndim >= mask.ndim
     axes = tuple(range(mask.ndim))
     perm = tuple(np.random.permutation(axes))
     img = img.transpose(perm + tuple(range(mask.ndim, img.ndim))) 
-    mask = mask.transpose(perm) 
+    mask = mask.transpose(perm)
     for ax in axes: 
         if np.random.rand() > 0.5:
             img = np.flip(img, axis=ax)
@@ -85,6 +127,8 @@ Y = [sorted([os.path.join(d, f) for f in os.listdir(d)]) for d in mask_directori
 X = sum(X, [])
 Y = sum(Y, [])
 
+assert all(Path(x).stem == Path(y).stem for x, y in zip(X, Y))
+
 print(f'Loading {len(X)} images and {len(Y)} masks')
 X = [read_tiff_file(f, channels_to_keep=channels_to_segment) for f in tqdm(X)]
 Y = [imread(f) for f in tqdm(Y)]
@@ -96,8 +140,6 @@ if panoptic:
     classes = sum(classes, [])
     classes = [pd.read_csv(c) for c in classes]
     classes = [dict(zip(c['label'], c['class'])) for c in classes]
-
-assert all(Path(x).stem == Path(y).stem for x, y in zip(X, Y))
 
 n_channel = 1 if X[0].ndim == 2 else X[0].shape[-1]
 
@@ -131,7 +173,7 @@ print('- validation:     %3d' % len(X_val))
 print(f'Using {n_rays} rays and {"GPU" if use_gpu else "CPU"}.')
 
 # Predict on subsampled grid for increased efficiency and larger field of view
-grid = (subsample_factor, subsample_factor)
+grid = (downsample_factor, downsample_factor)
 train_patch_size = (patch_size, patch_size)
 
 conf = Config2D (
@@ -147,18 +189,23 @@ if panoptic:
     if n_classes is None:
         n_classes = max([max(c.values()) for c in classes_trn])
     print(f"Using {n_classes} classes for panoptic segmentation.")
-    conf.n_class = n_classes
+    conf.n_classes = n_classes
 
 if use_gpu:
     from csbdeep.utils.tf import limit_gpu_memory
     limit_gpu_memory(None, allow_growth=True)
 
-if checkpoint_path is not None:
-    print(f"Continuing training from checkpoint: {checkpoint_path}")
-    path = Path(checkpoint_path)
-    model = StarDist2D(None, name=path.name, basedir=path.parent.absolute())
-    shutil.copytree(path, os.path.join(save_dir, model_name), dirs_exist_ok=True)
+if pretrained_model is not None:
+    print(f"Using pretrained model: {pretrained_model}")
+    model_pretrained = StarDist2D.from_pretrained(pretrained_model)
+    if model_pretrained.config.n_rays != n_rays:
+        raise ValueError(f"Number of rays in the pretrained model ({model_pretrained.config.n_rays}) does not match the number of rays in the config file ({n_rays}).")
+    if model_pretrained.config.grid != grid:
+        raise ValueError(f"Grid in the pretrained model ({model_pretrained.config.grid}) does not match the grid in the config file ({grid}).")
+
+    shutil.copytree(model_pretrained.logdir, os.path.join(save_dir, model_name), dirs_exist_ok=True, copy_function=copy_without_permissions)
     model = StarDist2D(None, name=model_name, basedir=save_dir)
+
     model.config.train_epochs = max_epochs
     model.config.train_steps_per_epoch = steps_per_epoch
     model.config.train_patch_size = train_patch_size
@@ -170,9 +217,40 @@ if checkpoint_path is not None:
         if n_classes is None:
             n_classes = max([max(c.values()) for c in classes_trn])
         print(f"Using {n_classes} classes for panoptic segmentation.")
-        model.config.n_class = n_classes
+        model.config.n_classes = n_classes
     else:
-        model.config.n_class = None
+        model.config.n_classes = None
+
+elif checkpoint_path is not None:
+    print(f"Continuing training from checkpoint: {checkpoint_path}")
+
+    # check if the checkpoint is compatible with the current configuration
+    path = Path(checkpoint_path)
+    model = StarDist2D(None, name=path.name, basedir=path.parent.absolute())
+    if model.config.n_rays != n_rays:
+        raise ValueError(f"Number of rays in the checkpoint ({model.config.n_rays}) does not match the number of rays in the config file ({n_rays}).")
+    if model.config.grid != grid:
+        raise ValueError(f"Grid in the checkpoint ({model.config.grid}) does not match the grid in the config file ({grid}).")
+    shutil.copytree(path, os.path.join(save_dir, model_name), dirs_exist_ok=True, copy_function=copy_without_permissions)
+    model = StarDist2D(None, name=model_name, basedir=save_dir)
+    # remove the config.json file to avoid confusion
+    os.remove(os.path.join(save_dir, model_name, 'config.json'))
+
+    model.config.train_epochs = max_epochs
+    model.config.train_steps_per_epoch = steps_per_epoch
+    model.config.train_patch_size = train_patch_size
+    model.config.grid = grid
+    model.config.n_rays = n_rays
+    model.config.use_gpu = use_gpu
+    model.config.n_channel_in = n_channel
+    if panoptic:
+        if n_classes is None:
+            n_classes = max([max(c.values()) for c in classes_trn])
+        print(f"Using {n_classes} classes for panoptic segmentation.")
+        model.config.n_classes = n_classes
+    else:
+        model.config.n_classes = None
+
 else:
     model = StarDist2D(conf, name=model_name, basedir=save_dir)
 
