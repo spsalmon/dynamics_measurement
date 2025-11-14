@@ -19,14 +19,17 @@ def class_from_res(res):
     cls_dict = dict((i+1,c) for i,c in enumerate(res['class_id']))
     return cls_dict
 
-def predict_stardist(image_path:str, output_path:str, model:StarDist2D, channels_to_keep:List[int], normalizer: csbdeep.Normalizer = PercentileNormalizer(1, 99.8, do_after=False), prob_thresh=None) -> None:
-	image = read_tiff_file(image_path, channels_to_keep=channels_to_keep)
-	nuclei_mask_stack = np.zeros_like(image, dtype="uint16")
-	for i, plane in enumerate(image):
-		img = normalize(plane, 1,99.8, axis=(0, 1))
-		labels, _ = model.predict_instances(img, prob_thresh=prob_thresh, normalizer=normalizer)
-		nuclei_mask_stack[i, :, :] = (labels).astype(np.uint16)
-	imwrite(output_path, nuclei_mask_stack, compression='zlib')
+def predict_stardist(image_path:str, output_path:str, model:StarDist2D, channels_to_keep:List[int], normalizer: csbdeep.data.Normalizer = PercentileNormalizer(1, 99.8, do_after=False), prob_thresh=None) -> None:
+	try:
+		image = read_tiff_file(image_path, channels_to_keep=channels_to_keep)
+		nuclei_mask_stack = np.zeros_like(image, dtype="uint16")
+		for i, plane in enumerate(image):
+			img = normalize(plane, 1,99.8, axis=(0, 1))
+			labels, _ = model.predict_instances(img, prob_thresh=prob_thresh, normalizer=normalizer)
+			nuclei_mask_stack[i, :, :] = (labels).astype(np.uint16)
+		imwrite(output_path, nuclei_mask_stack, compression='zlib')
+	except Exception as e:
+		print(f"Error processing {image_path}: {e}")
 
 # def segment_nuclei_panoptic_stardist(image_path:str, model:StarDist2D) -> None:
 
@@ -70,5 +73,5 @@ image_paths.sort()
 output_paths.sort()
 
 for img_path, out_path in tqdm(zip(image_paths, output_paths), total=len(image_paths)):
-	if model.n_classes is None or model.n_classes == 1:
+	if model.config.n_classes is None or model.n_classes == 1:
 		predict_stardist(img_path, out_path, model, channels_to_keep, prob_thresh=prob_thresh)
