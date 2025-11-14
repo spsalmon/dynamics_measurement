@@ -3,21 +3,19 @@ mask_directories: ["/mnt/towbin.data/shared/spsalmon/20250929_161842_172_ZIVA_60
 classes_directories: null
 
 save_dir: '/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/'
-model_name: 'fully_manual_emr1_60x'
+model_name: 'panoptic_emr1_60x'
 
-# continue_training_from_checkpoint: '/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/stardist_emr_semi_auto'
-# pretrained_model: "2D_versatile_fluo"
 pretrained_model: null
 continue_training_from_checkpoint: null
 
-panoptic: False
-n_classes: null
+panoptic: True
+n_classes: 1
 channels_to_segment: [0]
 downsample_factor: 1
-patch_size: 512
+patch_size: 1024
 n_rays: 32
 
-max_epochs: 400
-steps_per_epoch: 100
-use_gpu: false
+max_epochs: 1000
+steps_per_epoch: 500
+use_gpu: True
 train_val_split_ratio: 0.20
