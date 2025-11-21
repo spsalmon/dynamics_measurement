@@ -64,8 +64,9 @@ def predict_stardist(image_path:str, output_path:str, model:StarDist2D, channels
 input_dir = "/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/emr1_panoptic_dataset_60x_auto_seg/raw"
 output_dir = "/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/emr1_panoptic_dataset_60x_auto_seg/mask"
 os.makedirs(output_dir, exist_ok=True)
+prob_thresh = None
+rerun = False
 model = StarDist2D(None, name='emr1_60x', basedir='/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/')
-prob_thresh = 0.6
 channels_to_keep = [1]
 image_paths = [os.path.join(input_dir, f) for f in os.listdir(input_dir)]
 output_paths = [os.path.join(output_dir, os.path.basename(f)) for f in image_paths]
@@ -73,5 +74,7 @@ image_paths.sort()
 output_paths.sort()
 
 for img_path, out_path in tqdm(zip(image_paths, output_paths), total=len(image_paths)):
+	if not os.path.exists(out_path) or rerun:
+		continue
 	if model.config.n_classes is None or model.n_classes == 1:
 		predict_stardist(img_path, out_path, model, channels_to_keep, prob_thresh=prob_thresh)

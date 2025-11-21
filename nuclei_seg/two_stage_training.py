@@ -46,6 +46,10 @@ use_gpu = config.get("use_gpu", True)
 
 use_gpu = use_gpu and gputools_available()
 
+if not panoptic:
+    print('This script is intended for two-stage training for panoptic segmentation. Set "panoptic": true in the config file.')
+    exit(1)
+
 X = [sorted([os.path.join(d, f) for f in os.listdir(d)]) for d in image_directories]
 Y = [sorted([os.path.join(d, f) for f in os.listdir(d)]) for d in mask_directories]
 X = sum(X, [])
@@ -109,41 +113,16 @@ conf = Config2D (
     train_steps_per_epoch = steps_per_epoch,
     train_patch_size = train_patch_size,
 )
-if panoptic:
-    if n_classes is None:
-        n_classes = max([max(c.values()) for c in classes_trn])
-    print(f"Using {n_classes} classes for panoptic segmentation.")
-    conf.n_classes = n_classes
+
+if n_classes is None:
+    n_classes = max([max(c.values()) for c in classes_trn])
+print(f"Using {n_classes} classes for panoptic segmentation.")
+conf.n_classes = n_classes
 
 if use_gpu:
     from csbdeep.utils.tf import limit_gpu_memory
     limit_gpu_memory(None, allow_growth=True)
 
-if pretrained_model is not None:
-    print(f"Using pretrained model: {pretrained_model}")
-    model_pretrained = StarDist2D.from_pretrained(pretrained_model)
-    if model_pretrained.config.n_rays != n_rays:
-        raise ValueError(f"Number of rays in the pretrained model ({model_pretrained.config.n_rays}) does not match the number of rays in the config file ({n_rays}).")
-    if model_pretrained.config.grid != grid:
-        raise ValueError(f"Grid in the pretrained model ({model_pretrained.config.grid}) does not match the grid in the config file ({grid}).")
-
-    shutil.copytree(model_pretrained.logdir, os.path.join(save_dir, model_name), dirs_exist_ok=True, copy_function=copy_without_permissions)
-    model = StarDist2D(None, name=model_name, basedir=save_dir)
-
-    model.config.train_epochs = max_epochs
-    model.config.train_steps_per_epoch = steps_per_epoch
-    model.config.train_patch_size = train_patch_size
-    model.config.grid = grid
-    model.config.n_rays = n_rays
-    model.config.use_gpu = use_gpu
-    model.config.n_channel_in = n_channel
-    if panoptic:
-        if n_classes is None:
-            n_classes = max([max(c.values()) for c in classes_trn])
-        print(f"Using {n_classes} classes for panoptic segmentation.")
-        model.config.n_classes = n_classes
-    else:
-        model.config.n_classes = None
 
 elif checkpoint_path is not None:
     print(f"Continuing training from checkpoint: {checkpoint_path}")
@@ -167,14 +146,7 @@ elif checkpoint_path is not None:
     model.config.n_rays = n_rays
     model.config.use_gpu = use_gpu
     model.config.n_channel_in = n_channel
-    if panoptic:
-        if n_classes is None:
-            n_classes = max([max(c.values()) for c in classes_trn])
-        print(f"Using {n_classes} classes for panoptic segmentation.")
-        model.config.n_classes = n_classes
-    else:
-        model.config.n_classes = None
-
+    model.config.n_classes = n_classes
 else:
     model = StarDist2D(conf, name=model_name, basedir=save_dir)
 
@@ -185,9 +157,15 @@ print(f"network field of view :  {fov}")
 if any(median_size > fov):
     print("WARNING: median object size larger than field of view of the neural network.")
 
-if panoptic:
-    model.train(X_trn, Y_trn, classes = classes_trn, validation_data=(X_val,Y_val), augmenter=augmenter)
-else:
-    model.train(X_trn, Y_trn, validation_data=(X_val,Y_val), augmenter=augmenter)
+print("#### TRAINING THE SEGMENTATION PART OF THE NETWORK ####")
 
-model.optimize_thresholds(X_val, Y_val)
+model.train(X_trn, Y_trn, classes = classes_trn, validation_data=(X_val,Y_val), augmenter=augmenter)
+
+print("#### SEGMENTATION PART TRAINED ####")
+print("---------------------------------")
+print("#### USING THE TRAINED MODEL TO PREDICT MASKS FOR THE SECOND STAGE ####")
+print("---------------------------------")
+print("#### TRAINING THE CLASSIFICATION PART OF THE NETWORK ####")
+
+
+# model.optimize_thresholds(X_val, Y_val)
