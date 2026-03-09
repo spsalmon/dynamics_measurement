@@ -8,6 +8,7 @@ from glob import glob
 from tqdm import tqdm
 from tifffile import imread
 from csbdeep.utils import Path, normalize
+from csbdeep.utils.tf import limit_gpu_memory
 
 from stardist import fill_label_holes, random_label_cmap, calculate_extents, gputools_available
 from stardist.models import Config2D, StarDist2D
@@ -86,6 +87,9 @@ ind_train, ind_val = ind[:-n_val], ind[-n_val:]
 X_val, Y_val = [X[i] for i in ind_val]  , [Y[i] for i in ind_val]
 X_trn, Y_trn = [X[i] for i in ind_train], [Y[i] for i in ind_train]
 
+if steps_per_epoch == -1:
+    steps_per_epoch = len(X_trn) // batch_size
+
 if panoptic:
     assert len(X) == len(Y) == len(classes)
     classes_trn, classes_val = [classes[i] for i in ind_train], [classes[i] for i in ind_val]
@@ -116,7 +120,6 @@ if panoptic:
     conf.n_classes = n_classes
 
 if use_gpu:
-    from csbdeep.utils.tf import limit_gpu_memory
     limit_gpu_memory(None, allow_growth=True)
 
 if pretrained_model is not None:
@@ -186,7 +189,7 @@ if any(median_size > fov):
     print("WARNING: median object size larger than field of view of the neural network.")
 
 if panoptic:
-    model.train(X_trn, Y_trn, classes = classes_trn, validation_data=(X_val,Y_val), augmenter=augmenter)
+    model.train(X_trn, Y_trn, classes = classes_trn, validation_data=(X_val,Y_val,classes_val), augmenter=augmenter)
 else:
     model.train(X_trn, Y_trn, validation_data=(X_val,Y_val), augmenter=augmenter)
 

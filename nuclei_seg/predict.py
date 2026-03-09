@@ -24,7 +24,6 @@ def predict_stardist(image_path:str, output_path:str, model:StarDist2D, channels
 		image = read_tiff_file(image_path, channels_to_keep=channels_to_keep)
 		nuclei_mask_stack = np.zeros_like(image, dtype="uint16")
 		for i, plane in enumerate(image):
-			img = normalize(plane, 1,99.8, axis=(0, 1))
 			labels, _ = model.predict_instances(img, prob_thresh=prob_thresh, normalizer=normalizer)
 			nuclei_mask_stack[i, :, :] = (labels).astype(np.uint16)
 		imwrite(output_path, nuclei_mask_stack, compression='zlib')
