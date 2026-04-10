@@ -175,3 +175,5 @@ cython_debug/
 
 logs/
 *.v2
+
+plots/*

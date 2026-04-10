@@ -2,20 +2,15 @@ image_directories: ["/mnt/towbin.data/shared/spsalmon/stardist_database/60x_emr1
 mask_directories: ["/mnt/towbin.data/shared/spsalmon/stardist_database/60x_emr1_col10GFP_segmentation_dataset/merged_database/processed_annotations"]
 classes_directories: null
 
-save_dir: '/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/new/'
+save_dir: '/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/cellpose/'
 model_name: 'emr1_60x'
 
 pretrained_model: null
 continue_training_from_checkpoint: null
 
-panoptic: False
-n_classes: 1
 channels_to_segment: [0]
-downsample_factor: 1
-batch_size: 16
-patch_size: 512
-n_rays: 32
 
+batch_size: 8
 max_epochs: 1000
 steps_per_epoch: -1
 use_gpu: True

@@ -24,7 +24,7 @@ def predict_stardist(image_path:str, output_path:str, model:StarDist2D, channels
 		image = read_tiff_file(image_path, channels_to_keep=channels_to_keep)
 		nuclei_mask_stack = np.zeros_like(image, dtype="uint16")
 		for i, plane in enumerate(image):
-			labels, _ = model.predict_instances(img, prob_thresh=prob_thresh, normalizer=normalizer)
+			labels, _ = model.predict_instances(plane, prob_thresh=prob_thresh, normalizer=normalizer)
 			nuclei_mask_stack[i, :, :] = (labels).astype(np.uint16)
 		imwrite(output_path, nuclei_mask_stack, compression='zlib')
 	except Exception as e:
@@ -60,12 +60,12 @@ def predict_stardist(image_path:str, output_path:str, model:StarDist2D, channels
 # 		imwrite(os.path.join(output_mask_dir, os.path.basename(image_path)), nuclei_mask_stack, compression='zlib')
 # 		classes_df.to_csv(os.path.join(output_class_dir, os.path.basename(image_path).replace('.ome.tif', '.csv')), index=False)
 
-input_dir = "/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/emr1_panoptic_dataset_60x_auto_seg/raw"
-output_dir = "/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/emr1_panoptic_dataset_60x_auto_seg/mask"
+input_dir = "/mnt/towbin.data/shared/nschoonjans/20260227_Ziva_60X_405_EV-eat-6RNAi/raw_stacks/"
+output_dir = "/mnt/towbin.data/shared/nschoonjans/20260227_Ziva_60X_405_EV-eat-6RNAi/analysis_stacks/ch2_seg_stardist/"
 os.makedirs(output_dir, exist_ok=True)
 prob_thresh = None
 rerun = False
-model = StarDist2D(None, name='emr1_60x', basedir='/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/')
+model = StarDist2D(None, name='emr1_60x', basedir='/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/new/')
 channels_to_keep = [1]
 image_paths = [os.path.join(input_dir, f) for f in os.listdir(input_dir)]
 output_paths = [os.path.join(output_dir, os.path.basename(f)) for f in image_paths]
@@ -74,6 +74,11 @@ output_paths.sort()
 
 for img_path, out_path in tqdm(zip(image_paths, output_paths), total=len(image_paths)):
 	if not os.path.exists(out_path) or rerun:
-		continue
-	if model.config.n_classes is None or model.n_classes == 1:
-		predict_stardist(img_path, out_path, model, channels_to_keep, prob_thresh=prob_thresh)
+		if model.config.n_classes is None or model.n_classes == 1:
+			predict_stardist(img_path, out_path, model, channels_to_keep, prob_thresh=prob_thresh)
+		else:
+			pass
+	else:
+		print(f"Output already exists for {img_path}, skipping.")
+	
+		

@@ -1,152 +1,168 @@
 import numpy as np
-from towbintools.foundation.image_handling import read_tiff_file
+from tqdm import tqdm
 import os
-import matplotlib.pyplot as plt
-import cv2
-from skimage.util import img_as_ubyte
-import pandas as pd
-
-from skimage import (
-    data, restoration, util
-)
-
-from joblib import Parallel, delayed
-import warnings
+from tifffile import imread
 from towbintools.foundation.file_handling import get_dir_filemap, add_dir_to_experiment_filemap
-warnings.filterwarnings('ignore')
+import cv2
+from joblib import Parallel, delayed
 from time import perf_counter
+import pandas as pd
+from scipy import ndimage as ndi
+import polars as pl
 
+from queue import Queue
+from threading import Thread
+ 
+ 
+def prefetch_stacks(raw_paths, mask_paths, prefetch=8, channel=0):
+    q = Queue(maxsize=prefetch)
 
-def process_plane(plane, mask, kernel, plane_index):
-    raw = plane - 100.0
-    nuclei_mask = (mask > 0).astype(int)
-    nuclei_mask_bool = nuclei_mask == 1
-    nuclei_labels = mask
-    unique_labels = np.unique(nuclei_labels)
-    unique_labels = unique_labels[unique_labels > 0]
-    
-    plane_stats = []
+    def producer():
+        for raw_path, mask_path in zip(raw_paths, mask_paths):
+            raw = imread(raw_path)[:, channel]
+            mask = imread(mask_path)
+            q.put((raw_path, raw, mask))
+        q.put(None)
 
-    for lbl in unique_labels:
-        mask_of_label = (nuclei_labels == lbl).astype(int)
-        expanded_label = (
-            cv2.morphologyEx(img_as_ubyte(mask_of_label), cv2.MORPH_DILATE, kernel) > 0
-        ).astype(int)
-        cytoplasm_mask = (expanded_label - mask_of_label - nuclei_mask > 0).astype(int)
-        cytoplasm_mask = cytoplasm_mask == 1
-        
-        raw_cytoplasm = raw[cytoplasm_mask]
-        raw_nucleus = raw[nuclei_mask_bool]
+    Thread(target=producer, daemon=True).start()
+    while (item := q.get()) is not None:
+        yield item
 
-        mean_intensity_cytoplasm = np.mean(raw_cytoplasm)
-        median_intensity_cytoplasm = np.median(raw_cytoplasm)
-        mean_intensity_nucleus = np.mean(raw_nucleus)
-        median_intensity_nucleus = np.median(raw_nucleus)
-        intensity_ratio_mean = mean_intensity_nucleus / mean_intensity_cytoplasm
-        intensity_ratio_median = median_intensity_nucleus / median_intensity_cytoplasm
-        
-        plane_stats.append({
-            "Z": plane_index,
-            "Label": lbl,
-            "MeanIntensityCytoplasm": mean_intensity_cytoplasm,
-            "MedianIntensityCytoplasm": median_intensity_cytoplasm,
-            "MeanIntensityNucleus": mean_intensity_nucleus,
-            "MedianIntensityNucleus": median_intensity_nucleus,
-            "NucleusCytoplasmRatioMean": intensity_ratio_mean,
-            "NucleusCytoplasmRatioMedian": intensity_ratio_median,
+def _dilate_labels(label_image, small_kernel, big_kernel):
+    """
+    For each nucleus label, creates a 'donut' mask in the region between
+    small_kernel and big_kernel dilation distances from the nucleus boundary.
+    This peri-nuclear ring can be used to measure cytoplasmic signal while
+    avoiding the nucleus itself and pixels too close to it (reducing
+    under-segmentation artifacts).
+
+    Label identity is preserved via nearest-neighbor propagation (distance
+    transform), so overlapping donuts from adjacent nuclei are resolved by
+    proximity.
+    """
+    # Grey dilation expands label values, but conflicts at label borders need resolution.
+    # Approach: for each label, we need a proper expanded mask without cross-contamination.
+    # Fastest correct approach: dilate the binary occupied mask, then propagate labels
+    # via nearest-neighbor (voronoi-like) only within the dilated footprint.
+    occupied = label_image > 0
+    small_dilated_occupied = cv2.dilate(occupied.astype(np.uint8), small_kernel).astype(bool)
+    big_dilated_occupied = cv2.dilate(occupied.astype(np.uint8), big_kernel).astype(bool)
+    donut_occupied = np.logical_and(big_dilated_occupied, ~small_dilated_occupied)
+
+    # Propagate labels into the dilated region via nearest-label distance transform
+    # ndi.distance_transform_edt on the inverted label mask gives nearest-foreground coords
+    _, nearest_idx = ndi.distance_transform_edt(label_image == 0, return_indices=True)
+    expanded_labels = label_image[tuple(nearest_idx)]  # nearest label for every pixel
+    donut_labels = expanded_labels * donut_occupied  # only keep labels in the donut region, zero elsewhere
+
+    return donut_labels
+ 
+def process_plane(plane, mask, small_kernel, big_kernel, plane_index, camera_min=100.0):
+    if not np.any(mask):
+        return []
+
+    raw = plane.astype(np.float32) - camera_min
+    raw[raw < 0] = 0
+ 
+    labels = np.unique(mask)
+    labels = labels[labels > 0]
+ 
+    nucleus_means   = ndi.mean(raw,   mask, labels)
+    nucleus_medians = ndi.median(raw, mask, labels)
+ 
+    expanded = _dilate_labels(mask, small_kernel, big_kernel)
+    nuclei_footprint = mask > 0
+    cytoplasm_labels = expanded.copy()
+    cytoplasm_labels[nuclei_footprint] = 0
+ 
+    cyto_means   = ndi.mean(raw,   cytoplasm_labels, labels)
+    cyto_medians = ndi.median(raw, cytoplasm_labels, labels)
+ 
+    raw_all_nuc  = raw[nuclei_footprint]
+    raw_all_cyto = raw[cytoplasm_labels > 0]
+ 
+    agg_nuc_mean    = float(np.mean(raw_all_nuc))
+    agg_nuc_median  = float(np.median(raw_all_nuc))
+    agg_cyto_mean   = float(np.mean(raw_all_cyto))   if raw_all_cyto.size else np.nan
+    agg_cyto_median = float(np.median(raw_all_cyto)) if raw_all_cyto.size else np.nan
+    agg_ratio_mean   = agg_nuc_mean   / agg_cyto_mean   if agg_cyto_mean   else np.nan
+    agg_ratio_median = agg_nuc_median / agg_cyto_median if agg_cyto_median else np.nan
+ 
+    rows = []
+    for i, lbl in enumerate(labels):
+        cm   = float(cyto_means[i])
+        cmed = float(cyto_medians[i])
+        nm   = float(nucleus_means[i])
+        nmed = float(nucleus_medians[i])
+        rows.append({
+            "Z":                             plane_index,
+            "Label":                         int(lbl),
+            "MeanIntensityNucleus":          nm,
+            "MedianIntensityNucleus":        nmed,
+            "MeanIntensityCytoplasm":        cm,
+            "MedianIntensityCytoplasm":      cmed,
+            "NucleusCytoplasmRatioMean":     nm / cm   if cm   else np.nan,
+            "NucleusCytoplasmRatioMedian":   nmed / cmed if cmed else np.nan,
+            "MeanIntensityAllNuclei":        agg_nuc_mean,
+            "MedianIntensityAllNuclei":      agg_nuc_median,
+            "MeanIntensityAllCytoplasm":     agg_cyto_mean,
+            "MedianIntensityAllCytoplasm":   agg_cyto_median,
+            "NucleusCytoplasmRatioMeanAll":  agg_ratio_mean,
+            "NucleusCytoplasmRatioMedianAll": agg_ratio_median,
         })
-    
-    all_expanded_nuclei = cv2.morphologyEx(img_as_ubyte(nuclei_mask), cv2.MORPH_DILATE, kernel)
-    all_cytoplasm = (all_expanded_nuclei - nuclei_mask > 0).astype(int)
-    all_cytoplasm_bool = all_cytoplasm == 1
-
-    raw_all_nuclei = raw[nuclei_mask_bool]
-    raw_all_cytoplasm = raw[all_cytoplasm_bool]
-
-    mean_intensity_all_nuclei = np.mean(raw_all_nuclei)
-    median_intensity_all_nuclei = np.median(raw_all_nuclei)
-    mean_intensity_all_cytoplasm = np.mean(raw_all_cytoplasm)
-    median_intensity_all_cytoplasm = np.median(raw_all_cytoplasm)
-    intensity_ratio_mean_all = mean_intensity_all_nuclei / mean_intensity_all_cytoplasm
-    intensity_ratio_median_all = median_intensity_all_nuclei / median_intensity_all_cytoplasm
-    
-    for stat in plane_stats:
-        stat.update({
-            'MeanIntensityAllNuclei': mean_intensity_all_nuclei,
-            'MedianIntensityAllNuclei': median_intensity_all_nuclei,
-            'MeanIntensityAllCytoplasm': mean_intensity_all_cytoplasm,
-            'MedianIntensityAllCytoplasm': median_intensity_all_cytoplasm,
-            'NucleusCytoplasmRatioMeanAll': intensity_ratio_mean_all,
-            'NucleusCytoplasmRatioMedianAll': intensity_ratio_median_all
-        })
-    
-    return plane_stats
-
-
+ 
+    return rows
+ 
+ 
 def measure_stack_nuclear_stats(
     raw_stack,
     mask_stack,
-    kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-    n_jobs=1
+    small_kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    big_kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+    n_jobs=1,
 ):
-    start = perf_counter()
     results = Parallel(n_jobs=n_jobs)(
-        delayed(process_plane)(plane, mask, kernel, i)
+        delayed(process_plane)(plane, mask, small_kernel, big_kernel, i)
         for i, (plane, mask) in enumerate(zip(raw_stack, mask_stack))
     )
-    
     all_stats = [item for sublist in results for item in sublist]
-    print(f'Computed nuclear stats in {perf_counter() - start:.2f} s')
     return pd.DataFrame(all_stats)
 
-img_dir = '/mnt/towbin.data/shared/spsalmon/20241115_122955_248_ZIVA_40x_raga1_full_deletion/raw/pad2/'
-mask_dir = '/mnt/towbin.data/shared/spsalmon/20241115_122955_248_ZIVA_40x_raga1_full_deletion/analysis/ch2_stardist/pad2/'
-classification_dir = '/mnt/towbin.data/shared/spsalmon/20241115_122955_248_ZIVA_40x_raga1_full_deletion/analysis/ch2_nuclei_types_stardist/pad2/'
+experiment_dir = "/mnt/towbin.data/shared/nschoonjans/20260227_Ziva_60X_405_EV-eat-6RNAi"
+raw_dir = os.path.join(experiment_dir, "raw_stacks")
+raw_dir_name = os.path.basename(raw_dir)
+analysis_dir = os.path.join(experiment_dir, "analysis_stacks")
+report_dir = os.path.join(analysis_dir, "report")
+os.makedirs(analysis_dir, exist_ok=True)
+os.makedirs(report_dir, exist_ok=True)
 
-filemap = get_dir_filemap(img_dir)
-filemap = add_dir_to_experiment_filemap(filemap, mask_dir, "MaskPath")
-filemap = add_dir_to_experiment_filemap(filemap, classification_dir, "ClassificationPath")
+experiment_filemap = get_dir_filemap(raw_dir)
+experiment_filemap = experiment_filemap.rename({"ImagePath": raw_dir_name})
 
-output_dir = '/mnt/towbin.data/shared/spsalmon/20241115_122955_248_ZIVA_40x_raga1_full_deletion/analysis/nuclear_stats_stardist/pad2/'
+mask_dir = os.path.join(analysis_dir, "ch2_seg_cellpose")
+experiment_filemap = add_dir_to_experiment_filemap(experiment_filemap, mask_dir, os.path.basename(mask_dir))
+
+classification_dir = None
+output_dir = os.path.join(analysis_dir, "ch1_cellpose_measurements")
 os.makedirs(output_dir, exist_ok=True)
-# keep only rows with mask and classification
-filemap = filemap[filemap['MaskPath'] != '']
-filemap = filemap[filemap['ClassificationPath'] != '']
 
-# parallelize time loop with joblib
+# Filter out rows where mask is missing or output already exists
+rows_to_keep = []
+for row in experiment_filemap.iter_rows(named=True):
+    mask_col = os.path.basename(mask_dir)
+    if row[mask_col] is None or row[mask_col] == "":
+        continue
+    output_file_path = os.path.join(output_dir, os.path.basename(row[raw_dir_name]).replace(".ome.tiff", ".csv"))
+    if not os.path.exists(output_file_path):
+        rows_to_keep.append(row)
 
-def process_time(time, point_data):
-    print(f"Processing time {time}")
-    time_data = point_data[point_data['Time'] == time]
-    raw_path = time_data['ImagePath'].values[0]
-
-    output_path = os.path.join(output_dir, os.path.basename(raw_path).replace('.ome.tif', '.csv'))
-    if os.path.exists(output_path):
-        print(f"File {output_path} already exists, skipping")
-        return
+experiment_filemap = pl.DataFrame(rows_to_keep)
         
-    mask_path = time_data['MaskPath'].values[0]
-    classification_path = time_data['ClassificationPath'].values[0]
 
-    raw_stack = read_tiff_file(raw_path, channels_to_keep = [1])
-    mask_stack = read_tiff_file(mask_path)
+channel = 0
 
-    try:
-        classification_df = pd.read_csv(classification_path)
+for raw_path, raw_stack, mask_stack in tqdm(prefetch_stacks(experiment_filemap[raw_dir_name], experiment_filemap[os.path.basename(mask_dir)], channel=channel), total=len(experiment_filemap[raw_dir_name])):
 
-        nuclei_stats_df = measure_stack_nuclear_stats(raw_stack, mask_stack, n_jobs=16)
-        nuclei_stats_df = nuclei_stats_df.merge(classification_df, on=['Z', 'Label'], how='left')
-
-        nuclei_stats_df.to_csv(output_path, index=False)
-    except Exception as e:
-        print(f"Error processing time {time}: {e}")
-
-for point in filemap['Point'].unique():
-    print(f"Processing point {point}")
-    point_data = filemap[filemap['Point'] == point]
-
-    Parallel(n_jobs=1)(
-        delayed(process_time)(time, point_data) for time in point_data['Time'].unique()
-    )
-    # for time in point_data['Time'].unique():
-    #     process_time(time, point_data)
+    output_file_path = os.path.join(output_dir, os.path.basename(raw_path).replace(".ome.tiff", ".csv"))
+    stats_df = measure_stack_nuclear_stats(raw_stack, mask_stack, n_jobs=8)
+    stats_df.to_csv(output_file_path, index=False)
