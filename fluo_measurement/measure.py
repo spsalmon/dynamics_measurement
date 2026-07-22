@@ -12,6 +12,8 @@ import polars as pl
 
 from queue import Queue
 from threading import Thread
+
+from towbintools.foundation.file_handling import read_filemap
  
  
 def prefetch_stacks(raw_paths, mask_paths, prefetch=8, channel=0):
@@ -69,6 +71,8 @@ def process_plane(plane, mask, small_kernel, big_kernel, plane_index, camera_min
  
     nucleus_means   = ndi.mean(raw,   mask, labels)
     nucleus_medians = ndi.median(raw, mask, labels)
+
+    nucleus_sizes = ndi.sum(mask > 0, mask, labels)
  
     expanded = _dilate_labels(mask, small_kernel, big_kernel)
     nuclei_footprint = mask > 0
@@ -78,37 +82,23 @@ def process_plane(plane, mask, small_kernel, big_kernel, plane_index, camera_min
     cyto_means   = ndi.mean(raw,   cytoplasm_labels, labels)
     cyto_medians = ndi.median(raw, cytoplasm_labels, labels)
  
-    raw_all_nuc  = raw[nuclei_footprint]
-    raw_all_cyto = raw[cytoplasm_labels > 0]
- 
-    agg_nuc_mean    = float(np.mean(raw_all_nuc))
-    agg_nuc_median  = float(np.median(raw_all_nuc))
-    agg_cyto_mean   = float(np.mean(raw_all_cyto))   if raw_all_cyto.size else np.nan
-    agg_cyto_median = float(np.median(raw_all_cyto)) if raw_all_cyto.size else np.nan
-    agg_ratio_mean   = agg_nuc_mean   / agg_cyto_mean   if agg_cyto_mean   else np.nan
-    agg_ratio_median = agg_nuc_median / agg_cyto_median if agg_cyto_median else np.nan
- 
     rows = []
     for i, lbl in enumerate(labels):
         cm   = float(cyto_means[i])
         cmed = float(cyto_medians[i])
         nm   = float(nucleus_means[i])
         nmed = float(nucleus_medians[i])
+        size = float(nucleus_sizes[i])
         rows.append({
             "Z":                             plane_index,
             "Label":                         int(lbl),
+            "Size":                          size,
             "MeanIntensityNucleus":          nm,
             "MedianIntensityNucleus":        nmed,
             "MeanIntensityCytoplasm":        cm,
             "MedianIntensityCytoplasm":      cmed,
             "NucleusCytoplasmRatioMean":     nm / cm   if cm   else np.nan,
             "NucleusCytoplasmRatioMedian":   nmed / cmed if cmed else np.nan,
-            "MeanIntensityAllNuclei":        agg_nuc_mean,
-            "MedianIntensityAllNuclei":      agg_nuc_median,
-            "MeanIntensityAllCytoplasm":     agg_cyto_mean,
-            "MedianIntensityAllCytoplasm":   agg_cyto_median,
-            "NucleusCytoplasmRatioMeanAll":  agg_ratio_mean,
-            "NucleusCytoplasmRatioMedianAll": agg_ratio_median,
         })
  
     return rows
@@ -128,23 +118,33 @@ def measure_stack_nuclear_stats(
     all_stats = [item for sublist in results for item in sublist]
     return pd.DataFrame(all_stats)
 
-experiment_dir = "/mnt/towbin.data/shared/nschoonjans/20260227_Ziva_60X_405_EV-eat-6RNAi"
+experiment_dir = "/mnt/towbin.data/shared/spsalmon/20251023_115945_091_ZIVA_60x_397_405_yap_dynamics"
 raw_dir = os.path.join(experiment_dir, "raw_stacks")
 raw_dir_name = os.path.basename(raw_dir)
 analysis_dir = os.path.join(experiment_dir, "analysis_stacks")
-report_dir = os.path.join(analysis_dir, "report")
+report_dir = os.path.join(experiment_dir, "analysis", "report")
 os.makedirs(analysis_dir, exist_ok=True)
 os.makedirs(report_dir, exist_ok=True)
+
+channel = 0
 
 experiment_filemap = get_dir_filemap(raw_dir)
 experiment_filemap = experiment_filemap.rename({"ImagePath": raw_dir_name})
 
-mask_dir = os.path.join(analysis_dir, "ch2_seg_cellpose")
+mask_dir = os.path.join(analysis_dir, "ch2_seg_cellpose_stitched")
 experiment_filemap = add_dir_to_experiment_filemap(experiment_filemap, mask_dir, os.path.basename(mask_dir))
 
 classification_dir = None
-output_dir = os.path.join(analysis_dir, "ch1_cellpose_measurements")
+output_dir = os.path.join(analysis_dir, "ch1_cellpose_stitched_measurements")
 os.makedirs(output_dir, exist_ok=True)
+
+analysis_filemap_path = [os.path.join(report_dir, f) for f in os.listdir(report_dir) if "analysis_filemap_annotated" in f]
+print(f'Number of files in experiment filemap: {len(experiment_filemap)}')
+if len(analysis_filemap_path) > 0:
+    analysis_filemap = read_filemap(analysis_filemap_path[0]).select(["Point", "Time", "Ignore"])
+    experiment_filemap = experiment_filemap.join(analysis_filemap, on=["Point", "Time"], how="left").filter(~pl.col("Ignore")).drop("Ignore")
+
+print(f'Number of files to process after filtering: {len(experiment_filemap)}')
 
 # Filter out rows where mask is missing or output already exists
 rows_to_keep = []
@@ -157,9 +157,6 @@ for row in experiment_filemap.iter_rows(named=True):
         rows_to_keep.append(row)
 
 experiment_filemap = pl.DataFrame(rows_to_keep)
-        
-
-channel = 0
 
 for raw_path, raw_stack, mask_stack in tqdm(prefetch_stacks(experiment_filemap[raw_dir_name], experiment_filemap[os.path.basename(mask_dir)], channel=channel), total=len(experiment_filemap[raw_dir_name])):
 

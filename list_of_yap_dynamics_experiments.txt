@@ -1,0 +1,5 @@
+20240524_161257_273_LIPSI_40x_397_405_no_crash (good data, already analysed, separated in pads, not backed up ?, nd2 deleted) : has some oil and focus problems, kinda shitty actually, reannotated
+20240628_153634_380_LIPSI_40x_397_405_new_round_chambers (good data, already analysed, separated in pads, not backed up ?, nd2 deleted) : very few points in pad 2, reannotated
+20240719_132649_534_LIPSI_40x_397_405_new_round_chambers_repeat (very few points for pad1, separated in pads, not backed up, nd2 deleted) : analysis running
+20250411_ZIVA_40x_397_405_yap_dynamics (decent data, not analysed yet, not backed up): analysis running, problems reading the images
+20251023_115945_091_ZIVA_60x_397_405_yap_dynamics (good experiment, partially analysed, not backed up yet) : missing the nuclear segmentation and quantification
