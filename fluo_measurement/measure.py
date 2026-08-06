@@ -68,6 +68,9 @@ def process_plane(plane, mask, small_kernel, big_kernel, plane_index, camera_min
  
     labels = np.unique(mask)
     labels = labels[labels > 0]
+
+    # centroid per label
+    centroids = ndi.center_of_mass(mask > 0, mask, labels)
  
     nucleus_means   = ndi.mean(raw,   mask, labels)
     nucleus_medians = ndi.median(raw, mask, labels)
@@ -93,6 +96,8 @@ def process_plane(plane, mask, small_kernel, big_kernel, plane_index, camera_min
             "Z":                             plane_index,
             "Label":                         int(lbl),
             "Size":                          size,
+            "CentroidX":                     centroids[i][1],
+            "CentroidY":                     centroids[i][0],
             "MeanIntensityNucleus":          nm,
             "MedianIntensityNucleus":        nmed,
             "MeanIntensityCytoplasm":        cm,
@@ -127,6 +132,7 @@ os.makedirs(analysis_dir, exist_ok=True)
 os.makedirs(report_dir, exist_ok=True)
 
 channel = 0
+rerun = True
 
 experiment_filemap = get_dir_filemap(raw_dir)
 experiment_filemap = experiment_filemap.rename({"ImagePath": raw_dir_name})
@@ -153,7 +159,7 @@ for row in experiment_filemap.iter_rows(named=True):
     if row[mask_col] is None or row[mask_col] == "":
         continue
     output_file_path = os.path.join(output_dir, os.path.basename(row[raw_dir_name]).replace(".ome.tiff", ".csv"))
-    if not os.path.exists(output_file_path):
+    if not os.path.exists(output_file_path) or rerun:
         rows_to_keep.append(row)
 
 experiment_filemap = pl.DataFrame(rows_to_keep)

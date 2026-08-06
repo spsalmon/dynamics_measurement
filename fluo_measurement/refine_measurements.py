@@ -19,14 +19,14 @@ filemap = add_dir_to_experiment_filemap(filemap, nuclei_type_dir, "ch2_nuclei_ty
 cols = ["ch2_nuclei_type", "ch1_cellpose_stitched_measurements"]
 filemap = filemap.drop_nulls(subset=cols)
 
-def process_row(row):
+def process_row(row, rerun=True):
     try:
         measurements_path = row["ch1_cellpose_stitched_measurements"]
         nuclei_type_path = row["ch2_nuclei_type"]
 
         output_path = os.path.join(output_dir, os.path.basename(measurements_path))
 
-        if os.path.exists(output_path):
+        if os.path.exists(output_path) and not rerun:
             print(f"Output already exists for {measurements_path}, skipping.")
             return
 

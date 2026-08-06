@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from cellpose import models, io
 from cellpose.io import imread
+from cellpose.utils import stitch3D
 from tqdm import tqdm
 import os
 import polars as pl
@@ -28,7 +29,7 @@ def prefetch_stacks(raw_paths, prefetch=8, channel=None):
     while (item := q.get()) is not None:
         yield item
 
-experiment_dir = "/mnt/towbin.data/shared/spsalmon/20251023_115945_091_ZIVA_60x_397_405_yap_dynamics"
+experiment_dir = "/mnt/towbin.data/shared/spsalmon/20260609_163634_517_ZIVA_60x_307_405_yap_dynamics"
 raw_dir = os.path.join(experiment_dir, "raw_stacks")
 raw_dir_name = os.path.basename(raw_dir)
 analysis_dir = os.path.join(experiment_dir, "analysis_stacks")
@@ -66,7 +67,9 @@ image_paths = images_to_process
 print(f'Processing {len(image_paths)} images with Cellpose ...')
 
 for image_path, image in tqdm(prefetch_stacks(image_paths, channel=channel), total=len(image_paths)):
+    print(f'Image shape: {image.shape}')
 
     masks, _, _ = model.eval(image, z_axis=None, channel_axis=None, do_3D=False, batch_size=128)
+    masks = stitch3D(masks, stitch_threshold=0.25)
 
     imwrite(os.path.join(output_path, os.path.basename(image_path)), masks.astype(np.uint16), compression="zlib")
