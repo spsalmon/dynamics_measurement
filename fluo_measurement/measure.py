@@ -1,129 +1,239 @@
-import numpy as np
-from tqdm import tqdm
+"""
+Fast per-plane nucleus / peri-nuclear ("donut") intensity measurements.
+"""
+
 import os
-from tifffile import imread
-from towbintools.foundation.file_handling import get_dir_filemap, add_dir_to_experiment_filemap
+import numpy as np
 import cv2
-from joblib import Parallel, delayed
-from time import perf_counter
-import pandas as pd
-from scipy import ndimage as ndi
 import polars as pl
+from tifffile import imread, TiffFile
+from joblib import Parallel, delayed
+from tqdm import tqdm
+from towbintools.foundation.file_handling import get_dir_filemap, add_dir_to_experiment_filemap, read_filemap
 
-from queue import Queue
-from threading import Thread
+SMALL_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+BIG_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
 
-from towbintools.foundation.file_handling import read_filemap
- 
- 
-def prefetch_stacks(raw_paths, mask_paths, prefetch=8, channel=0):
-    q = Queue(maxsize=prefetch)
+COLUMNS = [
+    "Z", "Label", "Size", "CentroidX", "CentroidY",
+    "MeanIntensityNucleus", "MedianIntensityNucleus",
+    "MeanIntensityCytoplasm", "MedianIntensityCytoplasm",
+    "NucleusCytoplasmRatioMean", "NucleusCytoplasmRatioMedian",
+]
 
-    def producer():
-        for raw_path, mask_path in zip(raw_paths, mask_paths):
-            raw = imread(raw_path)[:, channel]
-            mask = imread(mask_path)
-            q.put((raw_path, raw, mask))
-        q.put(None)
 
-    Thread(target=producer, daemon=True).start()
-    while (item := q.get()) is not None:
-        yield item
+# --------------------------------------------------------------------------- #
+# primitives
+# --------------------------------------------------------------------------- #
+def _kernel_offsets(kernel):
+    """Kernel footprint as (dy, dx) offsets sorted by euclidean distance."""
+    ky, kx = np.nonzero(kernel)
+    cy = (kernel.shape[0] - 1) // 2
+    cx = (kernel.shape[1] - 1) // 2
+    dy, dx = ky - cy, kx - cx
+    keep = (dy != 0) | (dx != 0)
+    dy, dx = dy[keep], dx[keep]
+    order = np.argsort(dy * dy + dx * dx, kind="stable")
+    return dy[order], dx[order]
 
-def _dilate_labels(label_image, small_kernel, big_kernel):
+
+def _propagate_to_donut(mask, donut_idx, offsets):
     """
-    For each nucleus label, creates a 'donut' mask in the region between
-    small_kernel and big_kernel dilation distances from the nucleus boundary.
-    This peri-nuclear ring can be used to measure cytoplasmic signal while
-    avoiding the nucleus itself and pixels too close to it (reducing
-    under-segmentation artifacts).
+    Nearest-nucleus label for each donut pixel.
 
-    Label identity is preserved via nearest-neighbor propagation (distance
-    transform), so overlapping donuts from adjacent nuclei are resolved by
-    proximity.
+    Every donut pixel is by construction within the big-kernel footprint of some
+    nucleus, so scanning the footprint in order of increasing distance and
+    keeping the first hit gives the euclidean nearest label.
     """
-    # Grey dilation expands label values, but conflicts at label borders need resolution.
-    # Approach: for each label, we need a proper expanded mask without cross-contamination.
-    # Fastest correct approach: dilate the binary occupied mask, then propagate labels
-    # via nearest-neighbor (voronoi-like) only within the dilated footprint.
-    occupied = label_image > 0
-    small_dilated_occupied = cv2.dilate(occupied.astype(np.uint8), small_kernel).astype(bool)
-    big_dilated_occupied = cv2.dilate(occupied.astype(np.uint8), big_kernel).astype(bool)
-    donut_occupied = np.logical_and(big_dilated_occupied, ~small_dilated_occupied)
+    H, W = mask.shape
+    flat = mask.ravel()
+    y, x = np.divmod(donut_idx, W)
+    out = np.zeros(donut_idx.size, dtype=mask.dtype)
+    todo = np.arange(donut_idx.size)
+    for dy, dx in zip(*offsets):
+        if todo.size == 0:
+            break
+        yy = y[todo] + dy
+        xx = x[todo] + dx
+        ok = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+        v = np.zeros(todo.size, dtype=mask.dtype)
+        v[ok] = flat[yy[ok] * W + xx[ok]]
+        hit = v > 0
+        out[todo[hit]] = v[hit]
+        todo = todo[~hit]
+    return out
 
-    # Propagate labels into the dilated region via nearest-label distance transform
-    # ndi.distance_transform_edt on the inverted label mask gives nearest-foreground coords
-    _, nearest_idx = ndi.distance_transform_edt(label_image == 0, return_indices=True)
-    expanded_labels = label_image[tuple(nearest_idx)]  # nearest label for every pixel
-    donut_labels = expanded_labels * donut_occupied  # only keep labels in the donut region, zero elsewhere
 
-    return donut_labels
- 
-def process_plane(plane, mask, small_kernel, big_kernel, plane_index, camera_min=100.0):
-    if not np.any(mask):
-        return []
+def _group_median(lab, val, n):
+    """Median of `val` grouped by integer `lab` in [0, n)."""
+    order = np.lexsort((val, lab))
+    lab_s, val_s = lab[order], val[order]
+    counts = np.bincount(lab_s, minlength=n)
+    starts = np.zeros(n, dtype=np.int64)
+    np.cumsum(counts[:-1], out=starts[1:])
+    out = np.zeros(n, dtype=np.float64)
+    nz = np.flatnonzero(counts)
+    if nz.size == 0:
+        return out
+    mid = starts[nz] + counts[nz] // 2
+    m = val_s[mid].astype(np.float64)
+    even = (counts[nz] % 2) == 0
+    m[even] = 0.5 * (m[even] + val_s[mid[even] - 1])
+    out[nz] = m
+    return out
 
-    raw = plane.astype(np.float32) - camera_min
-    raw[raw < 0] = 0
- 
-    labels = np.unique(mask)
-    labels = labels[labels > 0]
 
-    # centroid per label
-    centroids = ndi.center_of_mass(mask > 0, mask, labels)
- 
-    nucleus_means   = ndi.mean(raw,   mask, labels)
-    nucleus_medians = ndi.median(raw, mask, labels)
+# --------------------------------------------------------------------------- #
+# per plane / per stack
+# --------------------------------------------------------------------------- #
+def process_plane(plane, mask, plane_index, offsets,
+                  small_kernel=SMALL_KERNEL, big_kernel=BIG_KERNEL,
+                  camera_min=100.0, compute_medians=True):
+    flat_mask = mask.ravel()
+    nuc_idx = np.flatnonzero(flat_mask)
+    if nuc_idx.size == 0:
+        return None
 
-    nucleus_sizes = ndi.sum(mask > 0, mask, labels)
- 
-    expanded = _dilate_labels(mask, small_kernel, big_kernel)
-    nuclei_footprint = mask > 0
-    cytoplasm_labels = expanded.copy()
-    cytoplasm_labels[nuclei_footprint] = 0
- 
-    cyto_means   = ndi.mean(raw,   cytoplasm_labels, labels)
-    cyto_medians = ndi.median(raw, cytoplasm_labels, labels)
- 
-    rows = []
-    for i, lbl in enumerate(labels):
-        cm   = float(cyto_means[i])
-        cmed = float(cyto_medians[i])
-        nm   = float(nucleus_means[i])
-        nmed = float(nucleus_medians[i])
-        size = float(nucleus_sizes[i])
-        rows.append({
-            "Z":                             plane_index,
-            "Label":                         int(lbl),
-            "Size":                          size,
-            "CentroidX":                     centroids[i][1],
-            "CentroidY":                     centroids[i][0],
-            "MeanIntensityNucleus":          nm,
-            "MedianIntensityNucleus":        nmed,
-            "MeanIntensityCytoplasm":        cm,
-            "MedianIntensityCytoplasm":      cmed,
-            "NucleusCytoplasmRatioMean":     nm / cm   if cm   else np.nan,
-            "NucleusCytoplasmRatioMedian":   nmed / cmed if cmed else np.nan,
-        })
- 
-    return rows
- 
- 
-def measure_stack_nuclear_stats(
-    raw_stack,
-    mask_stack,
-    small_kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-    big_kernel=cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-    n_jobs=1,
-):
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(process_plane)(plane, mask, small_kernel, big_kernel, i)
-        for i, (plane, mask) in enumerate(zip(raw_stack, mask_stack))
-    )
-    all_stats = [item for sublist in results for item in sublist]
-    return pd.DataFrame(all_stats)
+    W = mask.shape[1]
+    raw_flat = plane.ravel()
 
-experiment_dir = "/mnt/towbin.data/shared/spsalmon/20251023_115945_091_ZIVA_60x_397_405_yap_dynamics"
+    occupied = (mask > 0).view(np.uint8)
+    donut = (cv2.dilate(occupied, big_kernel).astype(bool)
+             & ~cv2.dilate(occupied, small_kernel).astype(bool))
+    donut_idx = np.flatnonzero(donut.ravel())
+    donut_lab = _propagate_to_donut(mask, donut_idx, offsets).astype(np.int64)
+
+    nuc_lab = flat_mask[nuc_idx].astype(np.int64)
+    n = int(nuc_lab.max()) + 1
+
+    nuc_val = raw_flat[nuc_idx].astype(np.float32)
+    nuc_val -= camera_min
+    np.clip(nuc_val, 0, None, out=nuc_val)
+    cyt_val = raw_flat[donut_idx].astype(np.float32)
+    cyt_val -= camera_min
+    np.clip(cyt_val, 0, None, out=cyt_val)
+
+    counts = np.bincount(nuc_lab, minlength=n)
+    nuc_sum = np.bincount(nuc_lab, weights=nuc_val, minlength=n)
+    y_sum = np.bincount(nuc_lab, weights=nuc_idx // W, minlength=n)
+    x_sum = np.bincount(nuc_lab, weights=nuc_idx % W, minlength=n)
+    cyt_cnt = np.bincount(donut_lab, minlength=n)
+    cyt_sum = np.bincount(donut_lab, weights=cyt_val, minlength=n)
+
+    labels = np.flatnonzero(counts)
+    c = counts[labels].astype(np.float64)
+    nuc_mean = nuc_sum[labels] / c
+    cy = y_sum[labels] / c
+    cx = x_sum[labels] / c
+    cc = cyt_cnt[labels]
+    cyt_mean = np.where(cc > 0, cyt_sum[labels] / np.maximum(cc, 1), 0.0)
+
+    if compute_medians:
+        nuc_med = _group_median(nuc_lab, nuc_val, n)[labels]
+        cyt_med = _group_median(donut_lab, cyt_val, n)[labels]
+    else:
+        nuc_med = np.full(labels.size, np.nan)
+        cyt_med = np.full(labels.size, np.nan)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio_mean = np.where(cyt_mean != 0, nuc_mean / cyt_mean, np.nan)
+        ratio_med = np.where(cyt_med != 0, nuc_med / cyt_med, np.nan)
+
+    return {
+        "Z": np.full(labels.size, plane_index, dtype=np.int32),
+        "Label": labels.astype(np.int32),
+        "Size": c,
+        "CentroidX": cx,
+        "CentroidY": cy,
+        "MeanIntensityNucleus": nuc_mean,
+        "MedianIntensityNucleus": nuc_med,
+        "MeanIntensityCytoplasm": cyt_mean,
+        "MedianIntensityCytoplasm": cyt_med,
+        "NucleusCytoplasmRatioMean": ratio_mean,
+        "NucleusCytoplasmRatioMedian": ratio_med,
+    }
+
+
+def measure_stack_nuclear_stats(raw_stack, mask_stack,
+                                small_kernel=SMALL_KERNEL,
+                                big_kernel=BIG_KERNEL,
+                                camera_min=100.0,
+                                compute_medians=True):
+    offsets = _kernel_offsets(big_kernel)
+    chunks = []
+    for i, (plane, mask) in enumerate(zip(raw_stack, mask_stack)):
+        res = process_plane(plane, mask, i, offsets, small_kernel, big_kernel,
+                            camera_min, compute_medians)
+        if res is not None:
+            chunks.append(res)
+    if not chunks:
+        return pl.DataFrame({c: [] for c in COLUMNS})
+    merged = {k: np.concatenate([c[k] for c in chunks]) for k in chunks[0]}
+    return pl.DataFrame(merged).select(COLUMNS)
+
+
+# --------------------------------------------------------------------------- #
+# I/O
+# --------------------------------------------------------------------------- #
+def read_channel(path, channel):
+    """Read a single channel of a (Z, C, Y, X) OME-TIFF without decoding the rest."""
+    try:
+        with TiffFile(path) as tif:
+            series = tif.series[0]
+            axes = series.axes
+            if "C" in axes and series.ndim >= 3:
+                store = series.aszarr()
+                import zarr
+                arr = zarr.open(store, mode="r")
+                sl = [slice(None)] * arr.ndim
+                sl[axes.index("C")] = channel
+                return np.asarray(arr[tuple(sl)])
+    except Exception:
+        pass
+    return imread(path)[:, channel]
+
+def process_file(raw_path, mask_path, output_path, channel=0,
+                 camera_min=100.0, compute_medians=True):
+    raw_stack = read_channel(raw_path, channel)
+    mask_stack = imread(mask_path)
+    df = measure_stack_nuclear_stats(raw_stack, mask_stack,
+                                     camera_min=camera_min,
+                                     compute_medians=compute_medians)
+    df.write_csv(output_path)
+    return output_path
+
+
+def run(raw_paths, mask_paths, output_paths, channel=0, n_jobs=8,
+        camera_min=100.0, compute_medians=True):
+    """
+    One process per file: no array pickling, I/O overlaps with compute.
+ 
+    `return_as` makes joblib yield results as they complete instead of
+    returning a finished list, which is what tqdm needs to update live.
+    "generator_unordered" needs joblib >= 1.4, "generator" >= 1.3.
+    """
+    jobs = (delayed(process_file)(r, m, o, channel, camera_min, compute_medians)
+            for r, m, o in zip(raw_paths, mask_paths, output_paths))
+    kwargs = dict(n_jobs=n_jobs, backend="loky", batch_size=1)
+    try:
+        parallel = Parallel(return_as="generator_unordered", **kwargs)
+    except (TypeError, ValueError):
+        try:
+            parallel = Parallel(return_as="generator", **kwargs)
+        except (TypeError, ValueError):
+            parallel = Parallel(**kwargs)  # old joblib: bar will not animate
+    with parallel:
+        for _ in tqdm(parallel(jobs), total=len(raw_paths), smoothing=0.1):
+            pass
+
+
+experiment_dir = "/mnt/towbin.data/shared/spsalmon/20260807_134551_682_ZIVA_60x_col10_reporter"
+mask_dir_name = "ch2_seg_cellpose"
+# nuclei_type_dir = "/mnt/towbin.data/shared/spsalmon/20260807_134551_682_ZIVA_60x_col10_reporter/analysis_stacks/ch2_nuclei_type"
+nuclei_type_dir = None
+channel = 2
+rerun = True
+
 raw_dir = os.path.join(experiment_dir, "raw_stacks")
 raw_dir_name = os.path.basename(raw_dir)
 analysis_dir = os.path.join(experiment_dir, "analysis_stacks")
@@ -131,17 +241,14 @@ report_dir = os.path.join(experiment_dir, "analysis", "report")
 os.makedirs(analysis_dir, exist_ok=True)
 os.makedirs(report_dir, exist_ok=True)
 
-channel = 0
-rerun = True
-
 experiment_filemap = get_dir_filemap(raw_dir)
 experiment_filemap = experiment_filemap.rename({"ImagePath": raw_dir_name})
 
-mask_dir = os.path.join(analysis_dir, "ch2_seg_cellpose_stitched")
+mask_dir = os.path.join(analysis_dir, mask_dir_name)
 experiment_filemap = add_dir_to_experiment_filemap(experiment_filemap, mask_dir, os.path.basename(mask_dir))
 
-classification_dir = None
-output_dir = os.path.join(analysis_dir, "ch1_cellpose_stitched_measurements")
+output_dir_name = f"ch{channel+1}_cellpose_measurements"
+output_dir = os.path.join(analysis_dir, output_dir_name)
 os.makedirs(output_dir, exist_ok=True)
 
 analysis_filemap_path = [os.path.join(report_dir, f) for f in os.listdir(report_dir) if "analysis_filemap_annotated" in f]
@@ -164,8 +271,52 @@ for row in experiment_filemap.iter_rows(named=True):
 
 experiment_filemap = pl.DataFrame(rows_to_keep)
 
-for raw_path, raw_stack, mask_stack in tqdm(prefetch_stacks(experiment_filemap[raw_dir_name], experiment_filemap[os.path.basename(mask_dir)], channel=channel), total=len(experiment_filemap[raw_dir_name])):
+raw_paths, mask_paths, output_paths = (
+    experiment_filemap[raw_dir_name].to_list(),
+    experiment_filemap[os.path.basename(mask_dir)].to_list(),
+    [os.path.join(output_dir, os.path.basename(r).replace(".ome.tiff", ".csv")) for r in experiment_filemap[raw_dir_name].to_list()]
+)
 
-    output_file_path = os.path.join(output_dir, os.path.basename(raw_path).replace(".ome.tiff", ".csv"))
-    stats_df = measure_stack_nuclear_stats(raw_stack, mask_stack, n_jobs=8)
-    stats_df.to_csv(output_file_path, index=False)
+run(raw_paths, mask_paths, output_paths, channel=channel, n_jobs=8)
+
+
+output_dir_final_measurements = output_dir + "_final"
+os.makedirs(output_dir_final_measurements, exist_ok=True)
+
+filemap = get_dir_filemap(output_dir)
+filemap = filemap.rename({"ImagePath": output_dir_name})
+if nuclei_type_dir is not None:
+    filemap = add_dir_to_experiment_filemap(filemap, nuclei_type_dir, "nuclei_type")
+cols = [output_dir_name]
+cols.append("nuclei_type") if nuclei_type_dir is not None else None
+filemap = filemap.drop_nulls(subset=cols)
+
+def process_row(row, rerun=True, combine_with_type=True):
+    try:
+        measurements_path = row[output_dir_name]
+
+        output_path = os.path.join(output_dir_final_measurements, os.path.basename(measurements_path))
+
+        if os.path.exists(output_path) and not rerun:
+            print(f"Output already exists for {measurements_path}, skipping.")
+            return
+
+        measurements_df = pl.read_csv(measurements_path)
+
+        if combine_with_type:
+            nuclei_type_path = row["nuclei_type"]
+            nuclei_type = pl.read_csv(nuclei_type_path)
+            measurements_with_type = measurements_df.join(nuclei_type, left_on="Label", right_on="Label", how="left")
+
+            # for each unique label, keep only the row with the maximum size
+            measurements_with_type = measurements_with_type.sort("Size", descending = True).unique(subset="Label", keep="first").sort("Label")
+
+            measurements_with_type.write_csv(output_path)
+        else:
+            measurements_df = measurements_df.sort("Size", descending = True).unique(subset="Label", keep="first").sort("Label")
+            measurements_df.write_csv(output_path)
+
+    except Exception as e:
+        print(f"Error processing row {row}: {e}")
+
+Parallel(n_jobs=-1)(delayed(process_row)(row, rerun=True, combine_with_type=(nuclei_type_dir is not None)) for row in tqdm(filemap.iter_rows(named=True), total=len(filemap), desc="Refining measurements"))

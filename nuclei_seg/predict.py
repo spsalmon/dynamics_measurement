@@ -1,84 +1,75 @@
 import numpy as np
-
-from glob import glob
+import matplotlib.pyplot as plt
+from cellpose import models, io
+from cellpose.io import imread
+from cellpose.utils import stitch3D
 from tqdm import tqdm
-from tifffile import imread
-from csbdeep.utils import normalize
-
-from stardist.models import StarDist2D, Config2D
-from stardist import gputools_available
-from tifffile import imwrite
 import os
-from csbdeep.data import PercentileNormalizer
-import csbdeep
-import pandas as pd
-from typing import List
-from utils import read_tiff_file
+import polars as pl
+from tifffile import imread, imwrite
 
-def class_from_res(res):
-    cls_dict = dict((i+1,c) for i,c in enumerate(res['class_id']))
-    return cls_dict
+from towbintools.foundation.file_handling import get_dir_filemap, read_filemap
+from queue import Queue
+from threading import Thread
+io.logger_setup()
 
-def predict_stardist(image_path:str, output_path:str, model:StarDist2D, channels_to_keep:List[int], normalizer: csbdeep.data.Normalizer = PercentileNormalizer(1, 99.8, do_after=False), prob_thresh=None) -> None:
-	try:
-		image = read_tiff_file(image_path, channels_to_keep=channels_to_keep)
-		nuclei_mask_stack = np.zeros_like(image, dtype="uint16")
-		for i, plane in enumerate(image):
-			labels, _ = model.predict_instances(plane, prob_thresh=prob_thresh, normalizer=normalizer)
-			nuclei_mask_stack[i, :, :] = (labels).astype(np.uint16)
-		imwrite(output_path, nuclei_mask_stack, compression='zlib')
-	except Exception as e:
-		print(f"Error processing {image_path}: {e}")
+def prefetch_stacks(raw_paths, prefetch=8, channel=None):
+    q = Queue(maxsize=prefetch)
 
-# def segment_nuclei_panoptic_stardist(image_path:str, model:StarDist2D) -> None:
+    def producer():
+        for raw_path in raw_paths:
+            raw = imread(raw_path)
+            if channel is not None:
+                raw = raw[:, channel]
+            raw = np.expand_dims(raw, axis=-1)
+            q.put((raw_path, raw))
+        q.put(None)
 
-# 	CLASS_VALUES = {"background": 0, "epidermis": 1, "intestine": 2, "other": 3, "error": 4}
-# 	CLASS_ID_TO_NAME = {v: k for k, v in CLASS_VALUES.items()}
+    Thread(target=producer, daemon=True).start()
+    while (item := q.get()) is not None:
+        yield item
+
+experiment_dir = "/mnt/towbin.data/shared/spsalmon/20260807_134551_682_ZIVA_60x_col10_reporter"
+raw_dir = os.path.join(experiment_dir, "raw_stacks")
+raw_dir_name = os.path.basename(raw_dir)
+analysis_dir = os.path.join(experiment_dir, "analysis_stacks")
+report_dir = os.path.join(experiment_dir, "analysis", "report")
+os.makedirs(analysis_dir, exist_ok=True)
+os.makedirs(report_dir, exist_ok=True)
+channel = 3
 
 
-# 	nuclei_image = imread(image_path)[:, 1, ...]
-# 	if nuclei_image.ndim > 2:
-# 		# Create an empty array of the same shape as the input image for storing the binary masks of segmented nuclei
-# 		nuclei_mask_stack = np.zeros_like(nuclei_image, dtype="uint8")
-# 		classes_df = pd.DataFrame()
-# 		# Perform nuclei segmentation on each plane in the stack
-# 		for index, plane in enumerate(nuclei_image):
-# 			img = normalize(plane, 1,99.8, axis=(0, 1))
-# 			labels, details = model.predict_instances(img, verbose = False, show_tile_progress=False)
-# 			classes = class_from_res(details)
-			
-# 			plane_classes_df = pd.DataFrame(list(classes.items()), columns=['Label', 'ClassID'])
-# 			plane_classes_df['Z'] = index
-# 			plane_classes_df['Class'] = plane_classes_df['ClassID'].map(CLASS_ID_TO_NAME)
-# 			classes_df = pd.concat([classes_df, plane_classes_df])
+experiment_filemap = get_dir_filemap(raw_dir)
+experiment_filemap = experiment_filemap.rename({"ImagePath": raw_dir_name})
 
-# 			# Store the mask in the output array
-# 			nuclei_mask_stack[index, :, :] = (labels).astype(np.uint8)
+analysis_filemap_path = [os.path.join(report_dir, f) for f in os.listdir(report_dir) if "analysis_filemap_annotated" in f]
+print(analysis_filemap_path)
+print(f'Number of files in experiment filemap: {len(experiment_filemap)}')
+if len(analysis_filemap_path) > 0:
+    analysis_filemap = read_filemap(analysis_filemap_path[0]).select(["Point", "Time", "Ignore"])
+    experiment_filemap = experiment_filemap.join(analysis_filemap, on=["Point", "Time"], how="left").filter(~pl.col("Ignore")).drop("Ignore")
 
-# 		print(f'DONE ! {os.path.basename(image_path)}')
-# 		# Save the mask
-# 		imwrite(os.path.join(output_mask_dir, os.path.basename(image_path)), nuclei_mask_stack, compression='zlib')
-# 		classes_df.to_csv(os.path.join(output_class_dir, os.path.basename(image_path).replace('.ome.tif', '.csv')), index=False)
+print(f'Number of files to process after filtering: {len(experiment_filemap)}')
+model = models.CellposeModel(gpu=True, pretrained_model="/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/cellpose/models/emr1_60x")
 
-input_dir = "/mnt/towbin.data/shared/nschoonjans/20260227_Ziva_60X_405_EV-eat-6RNAi/raw_stacks/"
-output_dir = "/mnt/towbin.data/shared/nschoonjans/20260227_Ziva_60X_405_EV-eat-6RNAi/analysis_stacks/ch2_seg_stardist/"
-os.makedirs(output_dir, exist_ok=True)
-prob_thresh = None
-rerun = False
-model = StarDist2D(None, name='emr1_60x', basedir='/mnt/towbin.data/shared/spsalmon/towbinlab_segmentation_database/stardist/new/')
-channels_to_keep = [1]
-image_paths = [os.path.join(input_dir, f) for f in os.listdir(input_dir)]
-output_paths = [os.path.join(output_dir, os.path.basename(f)) for f in image_paths]
-image_paths.sort()
-output_paths.sort()
+output_path = os.path.join(analysis_dir, f"ch{channel+1}_seg_cellpose")
+os.makedirs(output_path, exist_ok=True)
 
-for img_path, out_path in tqdm(zip(image_paths, output_paths), total=len(image_paths)):
-	if not os.path.exists(out_path) or rerun:
-		if model.config.n_classes is None or model.n_classes == 1:
-			predict_stardist(img_path, out_path, model, channels_to_keep, prob_thresh=prob_thresh)
-		else:
-			pass
-	else:
-		print(f"Output already exists for {img_path}, skipping.")
-	
-		
+image_paths = experiment_filemap[raw_dir_name].to_list()
+images_to_process = []
+for image_path in image_paths:
+    output_file_path = os.path.join(output_path, os.path.basename(image_path))
+    if not os.path.exists(output_file_path):
+        images_to_process.append(image_path)
+
+image_paths = images_to_process
+
+print(f'Processing {len(image_paths)} images with Cellpose ...')
+
+for image_path, image in tqdm(prefetch_stacks(image_paths, channel=channel), total=len(image_paths)):
+    print(f'Image shape: {image.shape}')
+
+    masks, _, _ = model.eval(image, z_axis=None, channel_axis=None, do_3D=False, batch_size=128)
+    masks = stitch3D(masks, stitch_threshold=0.25)
+
+    imwrite(os.path.join(output_path, os.path.basename(image_path)), masks.astype(np.uint16), compression="zlib")
