@@ -24,6 +24,7 @@ cols = [mask_column_name, nuclei_type_column_name]
 filemap = filemap.drop_nulls(subset=cols)
 
 type_id_to_type = {
+    0: "background",
     1: "epidermis",
     2: "intestine",
     3: "other",
